@@ -1,0 +1,147 @@
+//==============================================================================
+// UART Transmitter Module
+// Sends 8-bit data serially using 8N1 format (8 data, No parity, 1 stop bit)
+//==============================================================================
+
+module uart_tx (
+    // Clock and Reset
+    input  wire       clk,        // System clock (e.g., 50MHz)
+    input  wire       rst,        // Active-high reset
+    
+    // Data Interface
+    input  wire [7:0] tx_data,    // 8-bit data to transmit
+    input  wire       tx_start,   // Pulse high to start transmission
+    
+    // UART Output
+    output reg        tx,         // Serial transmit line
+    output reg        tx_busy     // High when transmitting
+);
+
+    //==========================================================================
+    // Parameters - Configurable Settings
+    //==========================================================================
+    parameter CLK_FREQ   = 50_000_000;  // 50 MHz system clock
+    parameter BAUD_RATE  = 9600;        // Baud rate (bits per second)
+    
+    // Calculate clock ticks per bit period
+    // Example: 50,000,000 / 9600 = 5208 clocks per bit
+    localparam BAUD_DIVIDE = CLK_FREQ / BAUD_RATE;
+    
+    //==========================================================================
+    // State Definitions
+    //==========================================================================
+    localparam IDLE  = 2'b00;   // Idle state, waiting for tx_start
+    localparam START = 2'b01;   // Sending start bit (0)
+    localparam DATA  = 2'b10;   // Sending 8 data bits
+    localparam STOP  = 2'b11;   // Sending stop bit (1)
+    
+    //==========================================================================
+    // Internal Signals
+    //==========================================================================
+    reg [12:0] baud_counter;    // Counts clock cycles for baud rate timing
+    reg        baud_tick;       // Pulses high every bit period
+    
+    reg [2:0]  bit_index;       // Tracks which data bit (0-7) we're sending
+    reg [1:0]  state;           // Current state of FSM
+    
+    //==========================================================================
+    // Baud Rate Generator
+    // Creates a tick every bit period (e.g., every 104µs at 9600 baud)
+    //==========================================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            baud_counter <= 0;
+            baud_tick    <= 0;
+        end
+        else begin
+            if (baud_counter == BAUD_DIVIDE - 1) begin
+                baud_counter <= 0;      // Reset counter
+                baud_tick    <= 1;      // Generate tick pulse
+            end
+            else begin
+                baud_counter <= baud_counter + 1;
+                baud_tick    <= 0;
+            end
+        end
+    end
+    
+    //==========================================================================
+    // State Machine - Controls Transmission
+    //==========================================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            // Reset: Initialize everything
+            state     <= IDLE;
+            tx        <= 1'b1;      // TX line idles HIGH
+            tx_busy   <= 1'b0;      // Not busy
+            bit_index <= 3'd0;      // Reset bit counter
+        end
+        else begin
+            case (state)
+                
+                //--------------------------------------------------------------
+                // IDLE State: Wait for transmission request
+                //--------------------------------------------------------------
+                IDLE: begin
+                    tx        <= 1'b1;          // Keep TX line HIGH (idle)
+                    tx_busy   <= 1'b0;          // Signal we're ready
+                    bit_index <= 3'd0;          // Reset bit counter
+                    
+                    if (tx_start) begin         // Start signal received?
+                        state   <= START;       // Move to START state
+                        tx_busy <= 1'b1;        // Now we're busy
+                    end
+                end
+                
+                //--------------------------------------------------------------
+                // START State: Send start bit (0)
+                //--------------------------------------------------------------
+                START: begin
+                    tx <= 1'b0;                 // START bit is always 0
+                    
+                    if (baud_tick) begin        // Bit period complete?
+                        state <= DATA;          // Move to DATA state
+                    end
+                end
+                
+                //--------------------------------------------------------------
+                // DATA State: Send 8 data bits (LSB first)
+                //--------------------------------------------------------------
+                DATA: begin
+                    tx <= tx_data[bit_index];   // Send current bit
+                    
+                    if (baud_tick) begin        // Bit period complete?
+                        if (bit_index == 3'd7) begin    // Sent all 8 bits?
+                            state     <= STOP;          // Move to STOP state
+                            bit_index <= 3'd0;          // Reset for next time
+                        end
+                        else begin
+                            bit_index <= bit_index + 1; // Next bit
+                        end
+                    end
+                end
+                
+                //--------------------------------------------------------------
+                // STOP State: Send stop bit (1)
+                //--------------------------------------------------------------
+                STOP: begin
+                    tx <= 1'b1;                 // STOP bit is always 1
+                    
+                    if (baud_tick) begin        // Bit period complete?
+                        state   <= IDLE;        // Return to IDLE
+                        tx_busy <= 1'b0;        // No longer busy
+                    end
+                end
+                
+                //--------------------------------------------------------------
+                // Default: Safety fallback
+                //--------------------------------------------------------------
+                default: begin
+                    state <= IDLE;
+                end
+                
+            endcase
+        end
+    end
+
+endmodule

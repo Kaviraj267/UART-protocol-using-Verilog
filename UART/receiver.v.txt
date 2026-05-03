@@ -1,0 +1,195 @@
+//==============================================================================
+// UART Receiver Module
+// Receives 8-bit data serially using 8N1 format (8 data, No parity, 1 stop bit)
+// Uses 16× oversampling for reliable reception
+//==============================================================================
+
+module uart_rx (
+    // Clock and Reset
+    input  wire       clk,          // System clock (e.g., 50MHz)
+    input  wire       rst,          // Active-high reset
+    
+    // UART Input
+    input  wire       rx,           // Serial receive line
+    
+    // Data Output
+    output reg  [7:0] rx_data,      // Received 8-bit data
+    output reg        rx_done,      // Pulses high for 1 clock when byte received
+    output reg        rx_error      // High if frame error (bad stop bit)
+);
+
+    //==========================================================================
+    // Parameters - Configurable Settings
+    //==========================================================================
+    parameter CLK_FREQ   = 50_000_000;  // 50 MHz system clock
+    parameter BAUD_RATE  = 9600;        // Baud rate (bits per second)
+    
+    // Calculate clock ticks for 16× oversampling
+    // Example: 50,000,000 / (9600 * 16) = 326 clocks per sample
+    localparam BAUD_DIVIDE = CLK_FREQ / (BAUD_RATE * 16);
+    
+    //==========================================================================
+    // State Definitions
+    //==========================================================================
+    localparam IDLE  = 2'b00;   // Idle, waiting for start bit
+    localparam START = 2'b01;   // Detected start bit, verifying
+    localparam DATA  = 2'b10;   // Receiving 8 data bits
+    localparam STOP  = 2'b11;   // Receiving stop bit
+    
+    //==========================================================================
+    // Internal Signals
+    //==========================================================================
+    reg [11:0] baud_counter;    // Counts clock cycles (for 16× sampling)
+    reg        baud_tick;       // Pulses 16 times per bit period
+    
+    reg [3:0]  sample_counter;  // Counts 0-15 within each bit period
+    reg        sample_tick;     // Pulses at middle of bit (count=8)
+    
+    reg [2:0]  bit_index;       // Tracks which data bit (0-7) we're receiving
+    reg [1:0]  state;           // Current state of FSM
+    
+    reg [7:0]  shift_reg;       // Shift register for incoming bits
+    
+    //==========================================================================
+    // Baud Rate Generator (16× Oversampling)
+    // Creates a tick 16 times per bit period
+    //==========================================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            baud_counter <= 0;
+            baud_tick    <= 0;
+        end
+        else begin
+            if (baud_counter == BAUD_DIVIDE - 1) begin
+                baud_counter <= 0;      // Reset counter
+                baud_tick    <= 1;      // Generate tick
+            end
+            else begin
+                baud_counter <= baud_counter + 1;
+                baud_tick    <= 0;
+            end
+        end
+    end
+    
+    //==========================================================================
+    // Sample Counter (Counts 0-15 within each bit period)
+    //==========================================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            sample_counter <= 0;
+        end
+        else begin
+            if (baud_tick) begin
+                if (state == IDLE) begin
+                    sample_counter <= 0;    // Reset when idle
+                end
+                else begin
+                    if (sample_counter == 15) begin
+                        sample_counter <= 0;    // Rollover
+                    end
+                    else begin
+                        sample_counter <= sample_counter + 1;
+                    end
+                end
+            end
+        end
+    end
+    
+    //==========================================================================
+    // Sample Tick Generation (Middle of bit = sample_counter 8)
+    //==========================================================================
+    always @(*) begin
+        sample_tick = (sample_counter == 8) && baud_tick;
+    end
+    
+    //==========================================================================
+    // State Machine - Controls Reception
+    //==========================================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            // Reset: Initialize everything
+            state          <= IDLE;
+            rx_data        <= 8'd0;
+            rx_done        <= 1'b0;
+            rx_error       <= 1'b0;
+            bit_index      <= 3'd0;
+            shift_reg      <= 8'd0;
+        end
+        else begin
+            // Default: rx_done is a pulse (1 clock cycle only)
+            rx_done <= 1'b0;
+            
+            case (state)
+                
+                //--------------------------------------------------------------
+                // IDLE State: Wait for start bit (1→0 transition)
+                //--------------------------------------------------------------
+                IDLE: begin
+                    rx_error  <= 1'b0;      // Clear error flag
+                    bit_index <= 3'd0;      // Reset bit counter
+                    
+                    if (rx == 1'b0) begin   // Detected falling edge (start bit)
+                        state <= START;     // Move to START state
+                    end
+                end
+                
+                //--------------------------------------------------------------
+                // START State: Verify start bit at middle sample
+                //--------------------------------------------------------------
+                START: begin
+                    if (sample_tick) begin          // Middle of start bit?
+                        if (rx == 1'b0) begin       // Confirm it's still 0
+                            state <= DATA;          // Valid start, go to DATA
+                        end
+                        else begin
+                            state <= IDLE;          // False alarm, back to IDLE
+                        end
+                    end
+                end
+                
+                //--------------------------------------------------------------
+                // DATA State: Sample 8 data bits (LSB first)
+                //--------------------------------------------------------------
+                DATA: begin
+                    if (sample_tick) begin          // Middle of bit period?
+                        shift_reg[bit_index] <= rx; // Store the bit
+                        
+                        if (bit_index == 3'd7) begin    // Received all 8 bits?
+                            state     <= STOP;          // Move to STOP state
+                            bit_index <= 3'd0;          // Reset counter
+                        end
+                        else begin
+                            bit_index <= bit_index + 1; // Next bit
+                        end
+                    end
+                end
+                
+                //--------------------------------------------------------------
+                // STOP State: Verify stop bit and output data
+                //--------------------------------------------------------------
+                STOP: begin
+                    if (sample_tick) begin          // Middle of stop bit?
+                        if (rx == 1'b1) begin       // Valid stop bit?
+                            rx_data  <= shift_reg;  // Output received data
+                            rx_done  <= 1'b1;       // Signal data ready
+                            rx_error <= 1'b0;       // No error
+                        end
+                        else begin
+                            rx_error <= 1'b1;       // Frame error!
+                        end
+                        state <= IDLE;              // Return to IDLE
+                    end
+                end
+                
+                //--------------------------------------------------------------
+                // Default: Safety fallback
+                //--------------------------------------------------------------
+                default: begin
+                    state <= IDLE;
+                end
+                
+            endcase
+        end
+    end
+
+endmodule
